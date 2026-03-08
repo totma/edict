@@ -31,3 +31,6 @@ edict/frontend/node_modules/
 # Backups
 *.bak*
 data
+
+# Local runtime state
+.runtime/
