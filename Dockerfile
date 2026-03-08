@@ -3,7 +3,7 @@
 # Then open: http://localhost:7891
 
 # Stage 1: 构建 React 前端
-FROM node:20-alpine AS frontend-build
+FROM --platform=${BUILDPLATFORM:-linux/amd64} node:20-alpine AS frontend-build
 WORKDIR /build
 COPY edict/frontend/package.json edict/frontend/package-lock.json ./
 RUN npm ci --silent
@@ -12,7 +12,7 @@ COPY edict/frontend/ ./
 RUN npx vite build --outDir /build/dist
 
 # Stage 2: 运行时
-FROM python:3.11-slim
+FROM --platform=${TARGETPLATFORM:-linux/amd64} python:3.11-slim
 
 WORKDIR /app
 

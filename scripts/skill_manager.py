@@ -30,17 +30,37 @@ from utils import now_iso, safe_name, read_json
 OCLAW_HOME = Path.home() / '.openclaw'
 
 
-def _download_file(url: str, timeout: int = 10) -> str:
-    """从 URL 下载文件内容（文本格式）"""
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'OpenClaw-SkillManager/1.0'})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content = resp.read(10 * 1024 * 1024)  # 最多 10MB
-            return content.decode('utf-8')
-    except urllib.error.HTTPError as e:
-        raise Exception(f'HTTP {e.code}: {e.reason}')
-    except Exception as e:
-        raise Exception(f'{type(e).__name__}: {e}')
+def _download_file(url: str, timeout: int = 30, retries: int = 3) -> str:
+    """从 URL 下载文件内容（文本格式），支持重试"""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'OpenClaw-SkillManager/1.0'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content = resp.read(10 * 1024 * 1024)  # 最多 10MB
+                return content.decode('utf-8')
+        except urllib.error.HTTPError as e:
+            last_error = f'HTTP {e.code}: {e.reason}'
+            if e.code in (404, 403):
+                break  # 不重试 4xx
+        except urllib.error.URLError as e:
+            last_error = f'网络错误: {e.reason}'
+        except Exception as e:
+            last_error = f'{type(e).__name__}: {e}'
+        
+        if attempt < retries:
+            import time
+            wait = attempt * 3  # 3s, 6s
+            print(f'   ⚠️ 第 {attempt} 次下载失败({last_error})，{wait}秒后重试...')
+            time.sleep(wait)
+    
+    # 所有重试失败
+    hint = ''
+    if 'timed out' in str(last_error).lower() or '超时' in str(last_error):
+        hint = '\n   💡 提示: 如果在中国大陆，请设置代理 export https_proxy=http://proxy:port'
+    elif '404' in str(last_error):
+        hint = '\n   💡 提示: 官方 Skills Hub 可能尚未发布该 skill，请检查 URL 是否正确'
+    raise Exception(f'{last_error} (已重试 {retries} 次){hint}')
 
 
 def _compute_checksum(content: str) -> str:
@@ -66,11 +86,12 @@ def add_remote(agent_id: str, name: str, source_url: str, description: str = '')
         content = _download_file(source_url)
     except Exception as e:
         print(f'❌ 下载失败：{e}')
+        print(f'   URL: {source_url}')
         return False
     
-    # 基础验证
-    if not content.startswith('---'):
-        print(f'❌ 文件格式无效：缺少 YAML frontmatter')
+    # 基础验证（放宽检查：有些 skill 不以 --- 开头）
+    if len(content.strip()) < 10:
+        print(f'❌ 文件内容过短或为空')
         return False
     
     # 保存 SKILL.md
@@ -227,6 +248,7 @@ def import_official_hub(agent_ids: list) -> bool:
     
     total = 0
     success = 0
+    failed = []
     
     for skill_name, url in OFFICIAL_SKILLS_HUB.items():
         # 确定目标 agents
@@ -241,8 +263,18 @@ def import_official_hub(agent_ids: list) -> bool:
             total += 1
             if add_remote(agent_id, skill_name, url, f'官方 skill：{skill_name}'):
                 success += 1
+            else:
+                failed.append(f'{agent_id}/{skill_name}')
     
     print(f'\n📊 导入完成：{success}/{total} 个 skills 成功')
+    if failed:
+        print(f'\n❌ 失败列表:')
+        for f in failed:
+            print(f'   - {f}')
+        print(f'\n💡 排查建议:')
+        print(f'   1. 检查网络: curl -I https://raw.githubusercontent.com/openclaw-ai/skills-hub/main/code_review/SKILL.md')
+        print(f'   2. 设置代理: export https_proxy=http://your-proxy:port')
+        print(f'   3. 单独重试: python3 scripts/skill_manager.py add-remote --agent <agent> --name <skill> --source <url>')
     return success == total
 
 
