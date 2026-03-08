@@ -1169,7 +1169,7 @@ function renderMonitor(tasks){
     const recentEdict = tasks.filter(t=>isEdict(t))
       .find(t=>(t.flow_log||[]).some(f=>f.from===d.label||f.to===d.label));
 
-    const isActive = myTasks.some(t=>t.state==='Doing');
+    const isActive = myTasks.some(t=>['Doing','Review','Assigned'].includes(t.state));
     const isBlocked = myTasks.some(t=>t.state==='Blocked');
     const off = offMap[d.id]||{};
     const hb = off.heartbeat||{status:'idle',label:'⚪'};

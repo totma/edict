@@ -20,6 +20,7 @@ MODEL_PRICING = {
     'openai/gpt-4o-mini':           {'in':0.15,'out':0.6,  'cr':0.075,'cw':0},
     'google/gemini-2.0-flash':      {'in':0.075,'out':0.3, 'cr':0,    'cw':0},
     'google/gemini-2.5-pro':        {'in':1.25,'out':10.0, 'cr':0,    'cw':0},
+    'kimi25proxy/kimi-k2.5':        {'in':0.6, 'out':3.0,  'cr':0,    'cw':0},
 }
 
 OFFICIALS = [
@@ -34,6 +35,7 @@ OFFICIALS = [
     {'id':'gongbu',  'label':'工部',  'role':'工部尚书','emoji':'🔧','rank':'正二品'},
     {'id':'libu_hr', 'label':'吏部',  'role':'吏部尚书','emoji':'👔','rank':'正二品'},
     {'id':'zaochao', 'label':'钦天监','role':'朝报官',  'emoji':'📰','rank':'正三品'},
+    {'id':'shiguan', 'label':'史官',  'role':'起居注官','emoji':'📖','rank':'正三品'},
 ]
 
 def rj(p, d):

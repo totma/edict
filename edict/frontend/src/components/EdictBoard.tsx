@@ -161,17 +161,19 @@ export default function EdictBoard() {
 
   const tasks = liveStatus?.tasks || [];
   const allEdicts = tasks.filter(isEdict);
-  const activeEdicts = allEdicts.filter((t) => !isArchived(t));
-  const archivedEdicts = allEdicts.filter((t) => isArchived(t));
+  const runtimeSessions = tasks.filter((t) => !isEdict(t));
+  const visibleEdicts = allEdicts.filter((t) => t.state !== 'Cancelled');
+  const activeEdicts = visibleEdicts.filter((t) => !isArchived(t));
+  const archivedEdicts = visibleEdicts.filter((t) => isArchived(t));
 
   let edicts: Task[];
   if (edictFilter === 'active') edicts = activeEdicts;
   else if (edictFilter === 'archived') edicts = archivedEdicts;
-  else edicts = allEdicts;
+  else edicts = visibleEdicts;
 
   edicts.sort((a, b) => (STATE_ORDER[a.state] ?? 9) - (STATE_ORDER[b.state] ?? 9));
 
-  const unArchivedDone = allEdicts.filter((t) => !t.archived && ['Done', 'Cancelled'].includes(t.state));
+  const unArchivedDone = visibleEdicts.filter((t) => !t.archived && t.state === 'Done');
 
   const handleArchiveAll = async () => {
     if (!confirm('将所有已完成/已取消的旨意移入归档？')) return;
@@ -209,7 +211,7 @@ export default function EdictBoard() {
           <button className="ab-btn" onClick={handleArchiveAll}>📦 一键归档</button>
         )}
         <span className="ab-count">
-          活跃 {activeEdicts.length} · 归档 {archivedEdicts.length} · 共 {allEdicts.length}
+          活跃 {activeEdicts.length} · 归档 {archivedEdicts.length} · 共 {visibleEdicts.length}
         </span>
         <button className="ab-scan" onClick={handleScan}>🧭 太子巡检</button>
       </div>
@@ -220,7 +222,9 @@ export default function EdictBoard() {
           <div className="empty" style={{ gridColumn: '1/-1' }}>
             暂无旨意<br />
             <small style={{ fontSize: 11, marginTop: 6, display: 'block', color: 'var(--muted)' }}>
-              通过飞书向太子发送任务，太子分拣后转中书省处理
+              {allEdicts.length === 0 && runtimeSessions.length > 0
+                ? `当前仅同步到 ${runtimeSessions.length} 个运行态会话，尚未生成 JJC 旨意记录`
+                : '通过飞书向太子发送任务，太子分拣后转中书省处理'}
             </small>
           </div>
         ) : (

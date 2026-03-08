@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { useStore, getPipeStatus, deptColor, stateLabel, STATE_LABEL } from '../store';
+import { formatLocalDateTime, formatLocalTime } from '../time';
 import { api } from '../api';
 import type {
   Task,
@@ -43,13 +44,7 @@ function fmtStalled(sec: number): string {
 }
 
 function fmtActivityTime(ts: number | string | undefined): string {
-  if (!ts) return '';
-  if (typeof ts === 'number') {
-    const d = new Date(ts);
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
-  }
-  if (typeof ts === 'string' && ts.length >= 19) return ts.substring(11, 19);
-  return String(ts).substring(0, 8);
+  return formatLocalTime(ts);
 }
 
 export default function TaskModal() {
@@ -302,8 +297,8 @@ export default function TaskModal() {
             </div>
             {sched && (
               <div className="sched-line">
-                {sched.lastProgressAt && <span>最近进展 {(sched.lastProgressAt || '').replace('T', ' ').substring(0, 19)}</span>}
-                {sched.lastDispatchAt && <span>最近派发 {(sched.lastDispatchAt || '').replace('T', ' ').substring(0, 19)}</span>}
+                {sched.lastProgressAt && <span>最近进展 {formatLocalDateTime(sched.lastProgressAt)}</span>}
+                {sched.lastDispatchAt && <span>最近派发 {formatLocalDateTime(sched.lastDispatchAt)}</span>}
                 <span>自动回滚 {sched.autoRollback === false ? '关闭' : '开启'}</span>
                 {sched.lastDispatchAgent && <span>目标 {sched.lastDispatchAgent}</span>}
               </div>
@@ -365,7 +360,7 @@ export default function TaskModal() {
                   const col = deptColor(fl.from || '');
                   return (
                     <div className="fl-item" key={i}>
-                      <div className="fl-time">{fl.at ? fl.at.substring(11, 16) : ''}</div>
+                      <div className="fl-time">{formatLocalTime(fl.at, { seconds: false })}</div>
                       <div className="fl-dot" style={{ background: col }} />
                       <div className="fl-content">
                         <div className="fl-who">

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../store';
+import { formatLocalDateTime } from '../time';
 import { api } from '../api';
 
 const FALLBACK_MODELS = [
@@ -128,7 +129,7 @@ export default function ModelConfig() {
               .slice(0, 15)
               .map((e, i) => (
                 <div className="cl-row" key={i}>
-                  <span className="cl-t">{(e.at || '').substring(0, 16).replace('T', ' ')}</span>
+                  <span className="cl-t">{formatLocalDateTime(e.at, { seconds: false })}</span>
                   <span className="cl-a">{e.agentId}</span>
                   <span className="cl-c">
                     <b>{e.oldModel}</b> → <b>{e.newModel}</b>

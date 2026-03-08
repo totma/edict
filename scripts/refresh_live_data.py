@@ -11,6 +11,11 @@ DATA = BASE / 'data'
 
 
 def output_meta(path):
+    if not isinstance(path, str) or not path.strip():
+        return {"exists": False, "lastModified": None}
+    path = path.strip()
+    if '\n' in path or len(path) > 240:
+        return {"exists": False, "lastModified": None}
     p = pathlib.Path(path)
     if not p.exists():
         return {"exists": False, "lastModified": None}

@@ -13,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message
 BASE = pathlib.Path(__file__).parent.parent
 DATA = BASE / 'data'
 OPENCLAW_CFG = pathlib.Path.home() / '.openclaw' / 'openclaw.json'
+CANONICAL_SCRIPTS_DIR = pathlib.Path.home() / '.openclaw' / 'workspace-main' / 'scripts'
 
 ID_LABEL = {
     'taizi':    {'label': '太子',   'role': '太子',     'duty': '飞书消息分拣与回奏',  'emoji': '🤴'},
@@ -27,6 +28,7 @@ ID_LABEL = {
     'gongbu':   {'label': '工部',   'role': '工部尚书', 'duty': '工程交付与自动化',    'emoji': '🔧'},
     'libu_hr':  {'label': '吏部',   'role': '吏部尚书', 'duty': '人事/培训/Agent管理',  'emoji': '👔'},
     'zaochao':  {'label': '钦天监', 'role': '朝报官',   'duty': '每日新闻采集与简报',  'emoji': '📰'},
+    'shiguan': {'label': '史官',   'role': '起居注官', 'duty': '高信噪比信号归档与外部记忆',  'emoji': '📖'},
 }
 
 KNOWN_MODELS = [
@@ -35,7 +37,7 @@ KNOWN_MODELS = [
     {'id': 'anthropic/claude-haiku-3-5',  'label': 'Claude Haiku 3.5',  'provider': 'Anthropic'},
     {'id': 'openai/gpt-4o',               'label': 'GPT-4o',            'provider': 'OpenAI'},
     {'id': 'openai/gpt-4o-mini',          'label': 'GPT-4o Mini',       'provider': 'OpenAI'},
-    {'id': 'openai-codex/gpt-5.3-codex',  'label': 'GPT-5.3 Codex',    'provider': 'OpenAI Codex'},
+    {'id': 'openai-codex/gpt-5.4',        'label': 'GPT-5.4',          'provider': 'OpenAI Codex'},
     {'id': 'google/gemini-2.0-flash',     'label': 'Gemini 2.0 Flash',  'provider': 'Google'},
     {'id': 'google/gemini-2.5-pro',       'label': 'Gemini 2.5 Pro',    'provider': 'Google'},
     {'id': 'copilot/claude-sonnet-4',     'label': 'Claude Sonnet 4',   'provider': 'Copilot'},
@@ -165,11 +167,12 @@ _SOUL_DEPLOY_MAP = {
     'gongbu': 'gongbu',
     'libu_hr': 'libu_hr',
     'zaochao': 'zaochao',
+    'shiguan': 'shiguan',
 }
 
 def sync_scripts_to_workspaces():
-    """将项目 scripts/ 目录同步到各 agent workspace（保持 kanban_update.py 等最新）"""
-    scripts_src = BASE / 'scripts'
+    """将统一脚本源同步到各 agent workspace。"""
+    scripts_src = CANONICAL_SCRIPTS_DIR if CANONICAL_SCRIPTS_DIR.is_dir() else (BASE / 'scripts')
     if not scripts_src.is_dir():
         return
     synced = 0
@@ -191,6 +194,21 @@ def sync_scripts_to_workspaces():
             if src_text != dst_text:
                 dst_file.write_bytes(src_text)
                 synced += 1
+    legacy_scripts = BASE / 'scripts'
+    if legacy_scripts.resolve() != scripts_src.resolve():
+        legacy_scripts.mkdir(parents=True, exist_ok=True)
+        for src_file in scripts_src.iterdir():
+            if src_file.suffix not in ('.py', '.sh') or src_file.stem.startswith('__'):
+                continue
+            dst_file = legacy_scripts / src_file.name
+            try:
+                src_text = src_file.read_bytes()
+                dst_text = dst_file.read_bytes() if dst_file.exists() else b''
+                if src_text != dst_text:
+                    dst_file.write_bytes(src_text)
+                    synced += 1
+            except Exception:
+                pass
     # also sync to workspace-main for legacy compatibility
     ws_main_scripts = pathlib.Path.home() / '.openclaw/workspace-main/scripts'
     ws_main_scripts.mkdir(parents=True, exist_ok=True)

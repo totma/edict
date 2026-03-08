@@ -116,7 +116,7 @@ function OfficialDetail({
 }) {
   const hb = o.heartbeat || { status: 'idle', label: '⚪ 待命' };
   const totTk = o.tokens_in + o.tokens_out + o.cache_read + o.cache_write;
-  const edicts = o.participated_edicts || [];
+  const edicts = (o.participated_edicts || []).filter((e) => e.state !== 'Cancelled');
 
   const tkBars = [
     { l: '输入', v: o.tokens_in, color: '#6a9eff' },

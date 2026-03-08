@@ -6,6 +6,9 @@
   # 新建任务（收旨时）
   python3 kanban_update.py create JJC-20260223-012 "任务标题" Zhongshu 中书省 中书令
 
+  # 自动分配当日下一个 JJC 编号并创建任务（推荐）
+  python3 kanban_update.py create_auto "任务标题" Zhongshu 中书省 中书令 "太子整理旨意"
+
   # 更新状态
   python3 kanban_update.py state JJC-20260223-012 Menxia "规划方案已提交门下省"
 
@@ -24,7 +27,38 @@
 """
 import json, pathlib, datetime, sys, subprocess, logging, os, re
 
-_BASE = pathlib.Path(__file__).resolve().parent.parent
+_SCRIPT_BASE = pathlib.Path(__file__).resolve().parent.parent
+
+def _resolve_dashboard_base():
+    candidates = []
+    for env_name in ('OPENCLAW_EDICT_HOME', 'OPENCLAW_DASHBOARD_HOME'):
+        raw = (os.environ.get(env_name) or '').strip()
+        if raw:
+            candidates.append(pathlib.Path(raw).expanduser())
+
+    home = pathlib.Path.home() / '.openclaw'
+    candidates.extend([
+        home / 'workspace' / 'edict',
+        home / 'workspace-main',
+        _SCRIPT_BASE,
+    ])
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (resolved / 'data').is_dir() and (resolved / 'scripts' / 'refresh_live_data.py').exists():
+            return resolved
+
+    return _SCRIPT_BASE
+
+_BASE = _resolve_dashboard_base()
 TASKS_FILE = _BASE / 'data' / 'tasks_source.json'
 REFRESH_SCRIPT = _BASE / 'scripts' / 'refresh_live_data.py'
 
@@ -33,6 +67,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message
 
 # 文件锁 —— 防止多 Agent 同时读写 tasks_source.json
 from file_lock import atomic_json_read, atomic_json_update, atomic_json_write  # noqa: E402
+
+try:
+    import shiguan_hooks  # noqa: E402
+except Exception:
+    shiguan_hooks = None
 
 STATE_ORG_MAP = {
     'Taizi': '太子', 'Zhongshu': '中书省', 'Menxia': '门下省', 'Assigned': '尚书省',
@@ -59,6 +98,15 @@ _AGENT_LABELS = {
     'zhongshu': '中书省', 'menxia': '门下省', 'shangshu': '尚书省',
     'libu': '礼部', 'hubu': '户部', 'bingbu': '兵部', 'xingbu': '刑部',
     'gongbu': '工部', 'libu_hr': '吏部', 'zaochao': '钦天监',
+}
+
+_EXECUTION_AGENT_IDS = {'shangshu', 'libu', 'hubu', 'bingbu', 'xingbu', 'gongbu', 'libu_hr'}
+_EXECUTION_DEPTS = {'尚书省', '礼部', '户部', '兵部', '刑部', '工部', '吏部'}
+_FLOW_STATE_TRANSITIONS = {
+    ('太子', '中书省'): ('Zhongshu', '中书省'),
+    ('中书省', '门下省'): ('Menxia', '门下省'),
+    ('门下省', '中书省'): ('Zhongshu', '中书省'),
+    ('门下省', '尚书省'): ('Assigned', '尚书省'),
 }
 
 MAX_PROGRESS_LOG = 100  # 单任务最大进展日志条数
@@ -89,6 +137,49 @@ _JUNK_TITLES = {
     '嗯', '哦', '知道了', '开启了么', '可以', '不行', '行', 'ok', 'yes', 'no',
     '你去开启', '测试', '试试', '看看',
 }
+_TASK_ID_RE = re.compile(r'^JJC-(\d{8})-(\d{3})$')
+_CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+class KanbanInputError(ValueError):
+    """输入参数校验失败。"""
+
+
+def _china_today_yyyymmdd():
+    return datetime.datetime.now(_CHINA_TZ).strftime('%Y%m%d')
+
+
+def _validate_new_task_id(task_id):
+    """校验新建任务 ID，默认要求日期必须是北京时间今天。"""
+    if not task_id:
+        raise KanbanInputError('任务ID为空')
+    match = _TASK_ID_RE.fullmatch(task_id)
+    if not match:
+        raise KanbanInputError(f'任务ID格式非法: {task_id}（应为 JJC-YYYYMMDD-NNN）')
+    if os.environ.get('KANBAN_ALLOW_NON_TODAY_ID') == '1':
+        return
+    task_day = match.group(1)
+    today_day = _china_today_yyyymmdd()
+    if task_day != today_day:
+        raise KanbanInputError(
+            f'任务ID日期与今日不一致: {task_day} ≠ {today_day}（如需回填请设置 KANBAN_ALLOW_NON_TODAY_ID=1）'
+        )
+
+
+def _next_jjc_task_id(tasks, day=None):
+    """基于现有 tasks 原子计算当日下一个 JJC 编号。"""
+    task_day = day or _china_today_yyyymmdd()
+    max_seq = 0
+    for task in tasks or []:
+        task_id = str((task or {}).get('id', '')).strip()
+        match = _TASK_ID_RE.fullmatch(task_id)
+        if not match or match.group(1) != task_day:
+            continue
+        try:
+            max_seq = max(max_seq, int(match.group(2)))
+        except Exception:
+            continue
+    return f'JJC-{task_day}-{max_seq + 1:03d}'
 
 def _sanitize_text(raw, max_len=80):
     """清洗文本：剥离文件路径、URL、Conversation 元数据、传旨前缀、截断过长内容。"""
@@ -151,6 +242,157 @@ def _infer_agent_id_from_runtime(task=None):
     return ''
 
 
+def _is_jjc_task(task):
+    return str((task or {}).get('id', '')).startswith('JJC-')
+
+
+def _has_execution_handoff(task):
+    if not task:
+        return False
+    if task.get('state') in ('Assigned', 'Review', 'Doing'):
+        return True
+    if task.get('org') in _EXECUTION_DEPTS:
+        return True
+
+    sched = task.get('_scheduler') or {}
+    if sched.get('lastDispatchAgent') in _EXECUTION_AGENT_IDS:
+        return True
+
+    for entry in task.get('flow_log', []) or []:
+        from_dept = entry.get('from', '')
+        to_dept = entry.get('to', '')
+        if from_dept in _EXECUTION_DEPTS or to_dept in _EXECUTION_DEPTS:
+            return True
+
+    for entry in task.get('progress_log', []) or []:
+        if entry.get('agent') in _EXECUTION_AGENT_IDS:
+            return True
+        if entry.get('org') in _EXECUTION_DEPTS:
+            return True
+
+    return False
+
+
+def _validate_terminal_transition(task, actor_agent_id, target_state='Done'):
+    if target_state not in ('Done', 'Cancelled'):
+        return
+    if not _is_jjc_task(task):
+        return
+
+    actor = (actor_agent_id or '').strip().lower()
+    if actor == 'menxia':
+        raise KanbanInputError('门下省不得将 JJC 任务直接标记完成；请给出审议意见或转尚书省执行')
+
+    if actor in _EXECUTION_AGENT_IDS:
+        return
+
+    if _has_execution_handoff(task):
+        return
+
+    raise KanbanInputError('JJC 任务尚未经过尚书省/六部执行链路，禁止直接标记完成')
+
+
+def _ensure_mutable_jjc_task(task, operation, target_state=None):
+    """禁止对已终态的 JJC 任务继续做普通写操作。"""
+    if not _is_jjc_task(task):
+        return
+    current_state = str((task or {}).get('state', '')).strip()
+    if current_state not in ('Done', 'Cancelled'):
+        return
+    if operation == 'state' and target_state == current_state:
+        return
+    raise KanbanInputError(
+        f'JJC 任务已处于终态（{current_state}），禁止通过 {operation} 重新打开或追加变更；请创建新任务ID'
+    )
+
+
+def _touch_scheduler_progress(task):
+    sched = _ensure_scheduler(task)
+    ts = now_iso()
+    sched['lastProgressAt'] = ts
+    sched['stallSince'] = None
+    sched['retryCount'] = 0
+    sched['escalationLevel'] = 0
+    sched['lastEscalatedAt'] = None
+
+
+def _ensure_scheduler(task):
+    sched = task.setdefault('_scheduler', {})
+    if not isinstance(sched, dict):
+        sched = {}
+        task['_scheduler'] = sched
+    sched.setdefault('enabled', True)
+    sched.setdefault('stallThresholdSec', 180)
+    sched.setdefault('maxRetry', 1)
+    sched.setdefault('retryCount', 0)
+    sched.setdefault('escalationLevel', 0)
+    sched.setdefault('autoRollback', True)
+    sched.setdefault('lastProgressAt', task.get('updatedAt') or now_iso())
+    sched.setdefault('stallSince', None)
+    sched.setdefault('lastDispatchStatus', 'idle')
+    sched.setdefault('snapshot', {
+        'state': task.get('state', ''),
+        'org': task.get('org', ''),
+        'now': task.get('now', ''),
+        'savedAt': now_iso(),
+        'note': 'init',
+    })
+    return sched
+
+
+def _scheduler_snapshot(task, note=''):
+    sched = _ensure_scheduler(task)
+    sched['snapshot'] = {
+        'state': task.get('state', ''),
+        'org': task.get('org', ''),
+        'now': task.get('now', ''),
+        'savedAt': now_iso(),
+        'note': note or 'snapshot',
+    }
+
+
+def _resolve_agent_for_task_state(state, org=''):
+    aid = _STATE_AGENT_MAP.get(state)
+    if aid is None and state in ('Doing', 'Next'):
+        aid = _ORG_AGENT_MAP.get(org)
+    return aid or ''
+
+
+def _mark_scheduler_dispatch(task, trigger='kanban-flow'):
+    sched = _ensure_scheduler(task)
+    agent_id = _resolve_agent_for_task_state(task.get('state', ''), task.get('org', ''))
+    if not agent_id:
+        return
+    sched['lastDispatchAt'] = now_iso()
+    sched['lastDispatchStatus'] = 'success'
+    sched['lastDispatchAgent'] = agent_id
+    sched['lastDispatchTrigger'] = trigger
+    sched['lastDispatchError'] = ''
+
+
+def _apply_flow_state_transition(task, from_dept, to_dept):
+    if not _is_jjc_task(task):
+        return
+    if task.get('state') in ('Done', 'Cancelled'):
+        return
+
+    next_state = None
+    next_org = None
+    direct = _FLOW_STATE_TRANSITIONS.get((from_dept, to_dept))
+    if direct:
+        next_state, next_org = direct
+    elif from_dept == '尚书省' and to_dept in _EXECUTION_DEPTS - {'尚书省'}:
+        next_state, next_org = 'Doing', to_dept
+    elif to_dept == '尚书省' and (from_dept in _EXECUTION_DEPTS - {'尚书省'} or from_dept == '六部'):
+        next_state, next_org = 'Review', '尚书省'
+
+    if not next_state:
+        return False
+    task['state'] = next_state
+    task['org'] = next_org
+    return True
+
+
 def _is_valid_task_title(title):
     """校验标题是否足够作为一个旨意任务。"""
     t = (title or '').strip()
@@ -172,6 +414,7 @@ def _is_valid_task_title(title):
 
 def cmd_create(task_id, title, state, org, official, remark=None):
     """新建任务（收旨时立即调用）"""
+    _validate_new_task_id(task_id)
     # 清洗标题（剥离元数据）
     title = _sanitize_title(title)
     # 旨意标题校验
@@ -182,14 +425,13 @@ def cmd_create(task_id, title, state, org, official, remark=None):
         return
     actual_org = STATE_ORG_MAP.get(state, org)
     clean_remark = _sanitize_remark(remark) if remark else f"下旨：{title}"
+    outcome = {'created': False, 'duplicate': False, 'existing_state': ''}
     def modifier(tasks):
         existing = next((t for t in tasks if t.get('id') == task_id), None)
         if existing:
-            if existing.get('state') in ('Done', 'Cancelled'):
-                log.warning(f'⚠️ 任务 {task_id} 已完结 (state={existing["state"]})，不可覆盖')
-                return tasks
-            if existing.get('state') not in (None, '', 'Inbox', 'Pending'):
-                log.warning(f'任务 {task_id} 已存在 (state={existing["state"]})，将被覆盖')
+            outcome['duplicate'] = True
+            outcome['existing_state'] = str(existing.get('state') or '')
+            return tasks
         tasks = [t for t in tasks if t.get('id') != task_id]
         tasks.insert(0, {
             "id": task_id, "title": title, "official": official,
@@ -199,26 +441,70 @@ def cmd_create(task_id, title, state, org, official, remark=None):
             "flow_log": [{"at": now_iso(), "from": "皇上", "to": actual_org, "remark": clean_remark}],
             "updatedAt": now_iso()
         })
+        outcome['created'] = True
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
+    if outcome['duplicate']:
+        raise KanbanInputError(
+            f'任务 {task_id} 已存在 (state={outcome["existing_state"] or "unknown"})，禁止重复创建'
+        )
     save(load())  # trigger refresh
     log.info(f'✅ 创建 {task_id} | {title[:30]} | state={state}')
+
+
+def cmd_create_auto(title, state, org, official, remark=None):
+    """原子分配当日下一个 JJC 编号并创建任务。成功时仅向 stdout 输出 task_id。"""
+    title = _sanitize_title(title)
+    valid, reason = _is_valid_task_title(title)
+    if not valid:
+        raise KanbanInputError(reason)
+    actual_org = STATE_ORG_MAP.get(state, org)
+    clean_remark = _sanitize_remark(remark) if remark else f"下旨：{title}"
+    result = {'task_id': ''}
+
+    def modifier(tasks):
+        task_id = _next_jjc_task_id(tasks)
+        result['task_id'] = task_id
+        tasks.insert(0, {
+            "id": task_id, "title": title, "official": official,
+            "org": actual_org, "state": state,
+            "now": clean_remark[:60] if remark else f"已下旨，等待{actual_org}接旨",
+            "eta": "-", "block": "无", "output": "", "ac": "",
+            "flow_log": [{"at": now_iso(), "from": "皇上", "to": actual_org, "remark": clean_remark}],
+            "updatedAt": now_iso()
+        })
+        return tasks
+
+    atomic_json_update(TASKS_FILE, modifier, [])
+    save(load())  # trigger refresh
+    task_id = result['task_id']
+    if not task_id:
+        raise KanbanInputError('自动创建任务失败：未生成任务ID')
+    log.info(f'✅ 自动创建 {task_id} | {title[:30]} | state={state}')
+    print(task_id)
 
 
 def cmd_state(task_id, new_state, now_text=None):
     """更新任务状态（原子操作）"""
     old_state = [None]
+    actor_agent = _infer_agent_id_from_runtime()
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'state', new_state)
+        _validate_terminal_transition(t, actor_agent, new_state)
+        if _is_jjc_task(t) and t.get('state') != new_state and t.get('state') not in ('Done', 'Cancelled'):
+            _scheduler_snapshot(t, f'state-before-{new_state}')
         old_state[0] = t['state']
         t['state'] = new_state
         if new_state in STATE_ORG_MAP:
             t['org'] = STATE_ORG_MAP[new_state]
         if now_text:
             t['now'] = now_text
+        _mark_scheduler_dispatch(t, 'kanban-state')
+        _touch_scheduler_progress(t)
         t['updatedAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
@@ -234,9 +520,16 @@ def cmd_flow(task_id, from_dept, to_dept, remark):
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'flow')
+        if _is_jjc_task(t) and t.get('state') not in ('Done', 'Cancelled'):
+            _scheduler_snapshot(t, f'flow-before-{from_dept}-to-{to_dept}')
+        changed = _apply_flow_state_transition(t, from_dept, to_dept)
         t.setdefault('flow_log', []).append({
             "at": now_iso(), "from": from_dept, "to": to_dept, "remark": clean_remark
         })
+        if changed:
+            _mark_scheduler_dispatch(t, 'kanban-flow')
+        _touch_scheduler_progress(t)
         t['updatedAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
@@ -246,14 +539,19 @@ def cmd_flow(task_id, from_dept, to_dept, remark):
 
 def cmd_done(task_id, output_path='', summary=''):
     """标记任务完成（原子操作）"""
+    actor_agent = _infer_agent_id_from_runtime()
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'done')
+        _validate_terminal_transition(t, actor_agent, 'Done')
         t['state'] = 'Done'
+        t['org'] = STATE_ORG_MAP.get('Done', '完成')
         t['output'] = output_path
         t['now'] = summary or '任务已完成'
+        _touch_scheduler_progress(t)
         t.setdefault('flow_log', []).append({
             "at": now_iso(), "from": t.get('org', '执行部门'),
             "to": "皇上", "remark": f"✅ 完成：{summary or '任务已完成'}"
@@ -262,6 +560,11 @@ def cmd_done(task_id, output_path='', summary=''):
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     save(load())  # trigger refresh
+    if shiguan_hooks is not None:
+        try:
+            shiguan_hooks.trigger_archive(task_id, output_path, summary)
+        except Exception:
+            log.exception(f'⚠️ {task_id} 史官 done hook 触发失败')
     log.info(f'✅ {task_id} 已完成')
 
 
@@ -272,8 +575,11 @@ def cmd_block(task_id, reason):
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'block')
         t['state'] = 'Blocked'
+        t['org'] = STATE_ORG_MAP.get('Blocked', '阻塞')
         t['block'] = reason
+        _touch_scheduler_progress(t)
         t['updatedAt'] = now_iso()
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
@@ -332,17 +638,20 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
 
     done_cnt = [0]
     total_cnt = [0]
+    inferred_agent = ['']
     def modifier(tasks):
         t = find_task(tasks, task_id)
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'progress')
         t['now'] = clean
         if parsed_todos is not None:
             t['todos'] = parsed_todos
         # 多 Agent 并行进展日志
         at = now_iso()
         agent_id = _infer_agent_id_from_runtime(t)
+        inferred_agent[0] = agent_id
         agent_label = _AGENT_LABELS.get(agent_id, agent_id)
         log_todos = parsed_todos if parsed_todos is not None else t.get('todos', [])
         log_entry = {
@@ -361,12 +670,18 @@ def cmd_progress(task_id, now_text, todos_pipe='', tokens=0, cost=0.0, elapsed=0
         # 限制 progress_log 大小，防止无限增长
         if len(t['progress_log']) > MAX_PROGRESS_LOG:
             t['progress_log'] = t['progress_log'][-MAX_PROGRESS_LOG:]
+        _touch_scheduler_progress(t)
         t['updatedAt'] = at
         done_cnt[0] = sum(1 for td in t.get('todos', []) if td.get('status') == 'completed')
         total_cnt[0] = len(t.get('todos', []))
         return tasks
     atomic_json_update(TASKS_FILE, modifier, [])
     save(load())  # trigger refresh
+    if shiguan_hooks is not None and inferred_agent[0]:
+        try:
+            shiguan_hooks.buffer_progress(task_id, clean, todos_pipe, inferred_agent[0])
+        except Exception:
+            log.exception(f'⚠️ {task_id} 史官 progress hook 写入失败')
     res_info = ''
     if tokens or cost or elapsed:
         res_info = f' [res: {tokens}tok/${cost:.4f}/{elapsed}s]'
@@ -387,6 +702,7 @@ def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
         if not t:
             log.error(f'任务 {task_id} 不存在')
             return tasks
+        _ensure_mutable_jjc_task(t, 'todo')
         if 'todos' not in t:
             t['todos'] = []
         existing = next((td for td in t['todos'] if str(td.get('id')) == str(todo_id)), None)
@@ -401,6 +717,7 @@ def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
             if detail:
                 item['detail'] = detail
             t['todos'].append(item)
+        _touch_scheduler_progress(t)
         t['updatedAt'] = now_iso()
         result_info[0] = sum(1 for td in t['todos'] if td.get('status') == 'completed')
         result_info[1] = len(t['todos'])
@@ -410,7 +727,7 @@ def cmd_todo(task_id, todo_id, title, status='not-started', detail=''):
     log.info(f'✅ {task_id} todo [{result_info[0]}/{result_info[1]}]: {todo_id} → {status}')
 
 _CMD_MIN_ARGS = {
-    'create': 6, 'state': 3, 'flow': 5, 'done': 2, 'block': 3, 'todo': 4, 'progress': 3,
+    'create': 6, 'create_auto': 5, 'state': 3, 'flow': 5, 'done': 2, 'block': 3, 'todo': 4, 'progress': 3,
 }
 
 if __name__ == '__main__':
@@ -423,55 +740,62 @@ if __name__ == '__main__':
         print(f'错误："{cmd}" 命令至少需要 {_CMD_MIN_ARGS[cmd]} 个参数，实际 {len(args)} 个')
         print(__doc__)
         sys.exit(1)
-    if cmd == 'create':
-        cmd_create(args[1], args[2], args[3], args[4], args[5], args[6] if len(args)>6 else None)
-    elif cmd == 'state':
-        cmd_state(args[1], args[2], args[3] if len(args)>3 else None)
-    elif cmd == 'flow':
-        cmd_flow(args[1], args[2], args[3], args[4])
-    elif cmd == 'done':
-        cmd_done(args[1], args[2] if len(args)>2 else '', args[3] if len(args)>3 else '')
-    elif cmd == 'block':
-        cmd_block(args[1], args[2])
-    elif cmd == 'todo':
-        # 解析可选 --detail 参数
-        todo_pos = []
-        todo_detail = ''
-        ti = 1
-        while ti < len(args):
-            if args[ti] == '--detail' and ti + 1 < len(args):
-                todo_detail = args[ti + 1]; ti += 2
-            else:
-                todo_pos.append(args[ti]); ti += 1
-        cmd_todo(
-            todo_pos[0] if len(todo_pos) > 0 else '',
-            todo_pos[1] if len(todo_pos) > 1 else '',
-            todo_pos[2] if len(todo_pos) > 2 else '',
-            todo_pos[3] if len(todo_pos) > 3 else 'not-started',
-            detail=todo_detail,
-        )
-    elif cmd == 'progress':
-        # 解析可选 --tokens/--cost/--elapsed 参数
-        pos_args = []
-        kw = {}
-        i = 1
-        while i < len(args):
-            if args[i] == '--tokens' and i + 1 < len(args):
-                kw['tokens'] = args[i + 1]; i += 2
-            elif args[i] == '--cost' and i + 1 < len(args):
-                kw['cost'] = args[i + 1]; i += 2
-            elif args[i] == '--elapsed' and i + 1 < len(args):
-                kw['elapsed'] = args[i + 1]; i += 2
-            else:
-                pos_args.append(args[i]); i += 1
-        cmd_progress(
-            pos_args[0] if len(pos_args) > 0 else '',
-            pos_args[1] if len(pos_args) > 1 else '',
-            pos_args[2] if len(pos_args) > 2 else '',
-            tokens=kw.get('tokens', 0),
-            cost=kw.get('cost', 0.0),
-            elapsed=kw.get('elapsed', 0),
-        )
-    else:
-        print(__doc__)
-        sys.exit(1)
+    try:
+        if cmd == 'create':
+            cmd_create(args[1], args[2], args[3], args[4], args[5], args[6] if len(args)>6 else None)
+        elif cmd == 'create_auto':
+            cmd_create_auto(args[1], args[2], args[3], args[4], args[5] if len(args)>5 else None)
+        elif cmd == 'state':
+            cmd_state(args[1], args[2], args[3] if len(args)>3 else None)
+        elif cmd == 'flow':
+            cmd_flow(args[1], args[2], args[3], args[4])
+        elif cmd == 'done':
+            cmd_done(args[1], args[2] if len(args)>2 else '', args[3] if len(args)>3 else '')
+        elif cmd == 'block':
+            cmd_block(args[1], args[2])
+        elif cmd == 'todo':
+            # 解析可选 --detail 参数
+            todo_pos = []
+            todo_detail = ''
+            ti = 1
+            while ti < len(args):
+                if args[ti] == '--detail' and ti + 1 < len(args):
+                    todo_detail = args[ti + 1]; ti += 2
+                else:
+                    todo_pos.append(args[ti]); ti += 1
+            cmd_todo(
+                todo_pos[0] if len(todo_pos) > 0 else '',
+                todo_pos[1] if len(todo_pos) > 1 else '',
+                todo_pos[2] if len(todo_pos) > 2 else '',
+                todo_pos[3] if len(todo_pos) > 3 else 'not-started',
+                detail=todo_detail,
+            )
+        elif cmd == 'progress':
+            # 解析可选 --tokens/--cost/--elapsed 参数
+            pos_args = []
+            kw = {}
+            i = 1
+            while i < len(args):
+                if args[i] == '--tokens' and i + 1 < len(args):
+                    kw['tokens'] = args[i + 1]; i += 2
+                elif args[i] == '--cost' and i + 1 < len(args):
+                    kw['cost'] = args[i + 1]; i += 2
+                elif args[i] == '--elapsed' and i + 1 < len(args):
+                    kw['elapsed'] = args[i + 1]; i += 2
+                else:
+                    pos_args.append(args[i]); i += 1
+            cmd_progress(
+                pos_args[0] if len(pos_args) > 0 else '',
+                pos_args[1] if len(pos_args) > 1 else '',
+                pos_args[2] if len(pos_args) > 2 else '',
+                tokens=kw.get('tokens', 0),
+                cost=kw.get('cost', 0.0),
+                elapsed=kw.get('elapsed', 0),
+            )
+        else:
+            print(__doc__)
+            sys.exit(1)
+    except KanbanInputError as exc:
+        log.warning(f'⚠️ 参数错误: {exc}')
+        print(f'[看板] 参数错误：{exc}')
+        sys.exit(2)

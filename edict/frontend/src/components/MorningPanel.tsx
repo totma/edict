@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { useStore } from '../store';
+import { formatLocalDateTime } from '../time';
 import { api } from '../api';
 import type { SubConfig, MorningNewsItem } from '../api';
 
@@ -268,7 +269,7 @@ export default function MorningPanel() {
                             <div className="mb-meta">
                               <span className="mb-source">📡 {item.source || ''}</span>
                               {item.pub_date && (
-                                <span className="mb-time">{item.pub_date.substring(0, 16)}</span>
+                                <span className="mb-time">{formatLocalDateTime(item.pub_date, { seconds: false })}</span>
                               )}
                             </div>
                           </div>

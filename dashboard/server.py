@@ -11,7 +11,7 @@ Endpoints:
   GET  /api/model-change-log   → data/model_change_log.json
   GET  /api/last-result        → data/last_model_change_result.json
 """
-import json, pathlib, subprocess, sys, threading, argparse, datetime, logging, re, os
+import json, pathlib, subprocess, sys, threading, argparse, datetime, logging, re, os, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -21,6 +21,18 @@ scripts_dir = str(pathlib.Path(__file__).parent.parent / 'scripts')
 sys.path.insert(0, scripts_dir)
 from file_lock import atomic_json_read, atomic_json_write, atomic_json_update
 from utils import validate_url
+
+# 动态模型升降级引擎（可选依赖，缺失时不影响正常派发）
+try:
+    from model_escalation import (
+        load_upgrade_config, decide_upgrade, apply_upgrade,
+        generate_checkpoint, revert_agent_on_transition,
+        cleanup_orphan_upgrades, get_upgrade_state, get_upgrade_log,
+    )
+    _ESCALATION_AVAILABLE = True
+except ImportError as _esc_err:
+    log.warning(f'model_escalation not available: {_esc_err}')
+    _ESCALATION_AVAILABLE = False
 
 log = logging.getLogger('server')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S')
@@ -84,6 +96,78 @@ def now_iso():
 
 def load_tasks():
     return atomic_json_read(DATA / 'tasks_source.json', [])
+
+
+_DASHBOARD_SYNC_LOCK = threading.Lock()
+_LAST_DASHBOARD_SYNC_AT = 0.0
+
+
+def _file_age_seconds(path):
+    try:
+        return max(0.0, time.time() - path.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def _needs_dashboard_refresh(max_age_sec=15):
+    live_status_file = DATA / 'live_status.json'
+    tasks_source_file = DATA / 'tasks_source.json'
+    sync_status_file = DATA / 'sync_status.json'
+
+    live_age = _file_age_seconds(live_status_file)
+    tasks_age = _file_age_seconds(tasks_source_file)
+    sync_age = _file_age_seconds(sync_status_file)
+
+    if live_age is None or tasks_age is None:
+        return True
+    if live_age > max_age_sec or tasks_age > max_age_sec:
+        return True
+    if sync_age is not None and sync_age > max_age_sec:
+        return True
+
+    live_status = read_json(live_status_file, {})
+    tasks_source = atomic_json_read(tasks_source_file, [])
+    if not isinstance(live_status, dict) or not isinstance(tasks_source, list):
+        return True
+
+    live_tasks = live_status.get('tasks')
+    if not isinstance(live_tasks, list):
+        return True
+
+    return len(live_tasks) != len(tasks_source)
+
+
+def ensure_dashboard_data_fresh(force=False, max_age_sec=15):
+    global _LAST_DASHBOARD_SYNC_AT
+
+    if not force and not _needs_dashboard_refresh(max_age_sec=max_age_sec):
+        return
+
+    if not _DASHBOARD_SYNC_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        if not force and not _needs_dashboard_refresh(max_age_sec=max_age_sec):
+            return
+
+        now_ts = time.time()
+        if not force and now_ts - _LAST_DASHBOARD_SYNC_AT < 3:
+            return
+
+        for script_name, timeout in (
+            ('sync_from_openclaw_runtime.py', 30),
+            ('sync_officials_stats.py', 30),
+            ('refresh_live_data.py', 30),
+        ):
+            subprocess.run(['python3', str(SCRIPTS / script_name)], timeout=timeout)
+
+        _LAST_DASHBOARD_SYNC_AT = time.time()
+    except Exception as e:
+        log.warning(f'看板数据自动刷新失败: {e}')
+    finally:
+        _DASHBOARD_SYNC_LOCK.release()
 
 
 def save_tasks(tasks):
@@ -610,6 +694,7 @@ def handle_review_action(task_id, action, comment=''):
 
     _ensure_scheduler(task)
     _scheduler_snapshot(task, f'review-before-{action}')
+    old_state = task.get('state', '')
 
     if action == 'approve':
         if task['state'] == 'Menxia':
@@ -629,6 +714,9 @@ def handle_review_action(task_id, action, comment=''):
         task['now'] = f'封驳退回中书省修订（第{round_num}轮）'
         remark = f'🚫 封驳：{comment or "需要修改"}'
         to_dept = '中书省'
+        # 标记封驳状态，供 decide_upgrade 检测 failure_escalation
+        sched = _ensure_scheduler(task)
+        sched['lastDispatchStatus'] = 'rejected'
     else:
         return {'ok': False, 'error': f'未知操作: {action}'}
 
@@ -641,6 +729,9 @@ def handle_review_action(task_id, action, comment=''):
     _scheduler_mark_progress(task, f'审议动作 {action} -> {task.get("state")}')
     task['updatedAt'] = now_iso()
     save_tasks(tasks)
+
+    # 🔻 状态转移时自动降级
+    _try_revert_on_state_change(task_id, old_state, task['state'], task)
 
     # 🚀 审批后自动派发对应 Agent
     new_state = task['state']
@@ -666,6 +757,7 @@ _AGENT_DEPTS = [
     {'id':'gongbu',  'label':'工部',  'emoji':'🔧', 'role':'工部尚书', 'rank':'正二品'},
     {'id':'libu_hr', 'label':'吏部',  'emoji':'👔', 'role':'吏部尚书', 'rank':'正二品'},
     {'id':'zaochao', 'label':'钦天监','emoji':'📰', 'role':'朝报官',   'rank':'正三品'},
+    {'id':'shiguan', 'label':'史官',  'emoji':'📖', 'role':'起居注官', 'rank':'正三品'},
 ]
 
 
@@ -681,12 +773,22 @@ def _check_gateway_alive():
 
 def _check_gateway_probe():
     """通过 HTTP probe 检测 Gateway 是否响应。"""
-    try:
-        from urllib.request import urlopen
-        resp = urlopen('http://127.0.0.1:18789/', timeout=3)
-        return resp.status == 200
-    except Exception:
-        return False
+    from urllib.request import urlopen
+
+    ports = []
+    env_port = os.getenv('OPENCLAW_GATEWAY_PORT')
+    if env_port and env_port.isdigit():
+        ports.append(int(env_port))
+    ports.extend([18790, 18789])
+
+    for port in dict.fromkeys(ports):
+        try:
+            resp = urlopen(f'http://127.0.0.1:{port}/', timeout=2)
+            if resp.status == 200:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _get_agent_session_status(agent_id):
@@ -708,7 +810,7 @@ def _get_agent_session_status(agent_id):
                 last_ts = ts
         now_ms = int(datetime.datetime.now().timestamp() * 1000)
         age_ms = now_ms - last_ts if last_ts else 9999999999
-        is_busy = age_ms <= 2 * 60 * 1000  # 2分钟内视为正在工作
+        is_busy = age_ms <= 10 * 60 * 1000  # 10分钟内视为正在工作
         return last_ts, session_count, is_busy
     except Exception:
         return 0, 0, False
@@ -1074,6 +1176,39 @@ def handle_scheduler_scan(threshold_sec=180):
     pending_rollbacks = []
     actions = []
     changed = False
+
+    # ── 动态升降级：孤立升级清理 + 循环信号消费 ──
+    if _ESCALATION_AVAILABLE:
+        try:
+            # 清理 task 已结束但 agent 未降级的孤立升级
+            active_ids = {t.get('id', '') for t in tasks if t.get('state') not in _TERMINAL_STATES and not t.get('archived')}
+            reverted_agents = cleanup_orphan_upgrades(active_ids)
+            for ra in reverted_agents:
+                actions.append({'taskId': '', 'action': 'orphan_revert', 'agent': ra})
+
+            # 消费史官循环检测信号
+            loop_dir = OCLAW_HOME / 'workspace-shiguan' / 'data' / 'loop_signals'
+            if loop_dir.exists():
+                import glob as _glob
+                for sig_path in _glob.glob(str(loop_dir / '*.json')):
+                    try:
+                        sig = json.loads(pathlib.Path(sig_path).read_text(encoding='utf-8'))
+                        loop_task_id = sig.get('task_id', '')
+                        loop_task = next((t for t in tasks if t.get('id') == loop_task_id), None)
+                        if loop_task and loop_task.get('state') not in _TERMINAL_STATES:
+                            sched = _ensure_scheduler(loop_task)
+                            bump = int(sig.get('bump', 1))
+                            esc_cfg = load_upgrade_config() or {}
+                            loop_bump = int(esc_cfg.get('loop_detection', {}).get('bump', 1))
+                            sched['pendingLoopUpgradeBump'] = max(bump, loop_bump)
+                            _scheduler_add_flow(loop_task, f'史官检测到循环，标记模型升级 +{sched["pendingLoopUpgradeBump"]} tier')
+                            changed = True
+                            log.info(f'[循环信号] {loop_task_id}: 标记待升级 +{sched["pendingLoopUpgradeBump"]}')
+                        pathlib.Path(sig_path).unlink(missing_ok=True)
+                    except Exception as _le:
+                        log.warning(f'loop signal read error: {_le}')
+        except Exception as _esc_scan_err:
+            log.warning(f'[升降级扫描异常]: {_esc_scan_err}')
 
     for task in tasks:
         task_id = task.get('id', '')
@@ -1883,6 +2018,31 @@ _STATE_LABELS = {
 }
 
 
+def _try_revert_on_state_change(task_id, old_state, new_state, task):
+    """状态转移时检查旧 agent 是否需要降级。"""
+    if not _ESCALATION_AVAILABLE:
+        return
+    try:
+        old_agent = _STATE_AGENT_MAP.get(old_state)
+        if old_agent is None and old_state in ('Doing', 'Next'):
+            old_agent = _ORG_AGENT_MAP.get(task.get('org', ''))
+        new_agent = _STATE_AGENT_MAP.get(new_state)
+        if new_agent is None and new_state in ('Doing', 'Next'):
+            new_agent = _ORG_AGENT_MAP.get(task.get('org', ''))
+        if old_agent and old_agent != new_agent:
+            reverted, msg = revert_agent_on_transition(old_agent, task_id)
+            if reverted:
+                log.info(f'🔻 {task_id} 状态转移 {old_state}→{new_state}，{old_agent} 模型降级: {msg}')
+                task.setdefault('flow_log', []).append({
+                    'at': now_iso(),
+                    'from': '太子调度',
+                    'to': task.get('org', ''),
+                    'remark': f'🔻 模型降级：{old_agent} 降回 base tier（任务离开该 agent）'
+                })
+    except Exception as e:
+        log.warning(f'[降级检查异常] {task_id}: {e}')
+
+
 def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
     """推进/审批后自动派发对应 Agent（后台异步，不阻塞响应）。"""
     agent_id = _STATE_AGENT_MAP.get(new_state)
@@ -1956,7 +2116,41 @@ def dispatch_for_state(task_id, task, new_state, trigger='state-transition'):
                     'lastDispatchTrigger': trigger,
                 }))
                 return
-            cmd = ['openclaw', 'agent', '--agent', agent_id, '-m', msg,
+
+            # ── 动态模型升级检查 ──
+            effective_msg = msg
+            if _ESCALATION_AVAILABLE:
+                try:
+                    esc_cfg = load_upgrade_config()
+                    if esc_cfg:
+                        decision = decide_upgrade(agent_id, task, msg, trigger, esc_cfg)
+                        if decision.get('should_upgrade'):
+                            new_tier = decision['new_tier']
+                            new_model = decision['new_model']
+                            reason = decision['reason']
+                            # 1. 史官 K2.5 生成压缩摘要
+                            checkpoint = generate_checkpoint(task, agent_id, reason)
+                            # 2. 修改 openclaw.json + 重启 Gateway
+                            ok, esc_msg = apply_upgrade(
+                                agent_id, new_tier, new_model, task_id, reason
+                            )
+                            if ok:
+                                effective_msg = checkpoint + '\n\n' + msg
+                                _update_task_scheduler(task_id, lambda t, s: (
+                                    t.setdefault('flow_log', []).append({
+                                        'at': now_iso(),
+                                        'from': '太子调度',
+                                        'to': task.get('org', ''),
+                                        'remark': f'🔺 模型升级：{agent_id} → tier {new_tier} ({new_model})，原因: {reason}'
+                                    }),
+                                ))
+                                log.info(f'[升级派发] {task_id} {agent_id} → tier {new_tier}: {reason}')
+                            else:
+                                log.warning(f'[升级失败] {task_id} {agent_id}: {esc_msg}')
+                except Exception as _esc_err:
+                    log.warning(f'[升级检查异常] {task_id}: {_esc_err}')
+
+            cmd = ['openclaw', 'agent', '--agent', agent_id, '-m', effective_msg,
                    '--deliver', '--channel', 'feishu', '--timeout', '300']
             max_retries = 2
             err = ''
@@ -2047,6 +2241,9 @@ def handle_advance_state(task_id, comment=''):
     task['updatedAt'] = now_iso()
     save_tasks(tasks)
 
+    # 🔻 状态转移时自动降级：旧 agent 模型降回 base tier
+    _try_revert_on_state_change(task_id, cur, next_state, task)
+
     # 🚀 推进后自动派发对应 Agent（Done 状态无需派发）
     if next_state != 'Done':
         dispatch_for_state(task_id, task, next_state)
@@ -2129,14 +2326,26 @@ class Handler(BaseHTTPRequestHandler):
             all_ok = all(checks.values())
             self.send_json({'status': 'ok' if all_ok else 'degraded', 'ts': now_iso(), 'checks': checks})
         elif p == '/api/live-status':
+            ensure_dashboard_data_fresh()
             self.send_json(read_json(DATA / 'live_status.json'))
         elif p == '/api/agent-config':
             self.send_json(read_json(DATA / 'agent_config.json'))
         elif p == '/api/model-change-log':
             self.send_json(read_json(DATA / 'model_change_log.json', []))
+        elif p == '/api/model-upgrade-log':
+            if _ESCALATION_AVAILABLE:
+                self.send_json(get_upgrade_log(100))
+            else:
+                self.send_json([])
+        elif p == '/api/model-upgrade-state':
+            if _ESCALATION_AVAILABLE:
+                self.send_json(get_upgrade_state())
+            else:
+                self.send_json({})
         elif p == '/api/last-result':
             self.send_json(read_json(DATA / 'last_model_change_result.json', {}))
         elif p == '/api/officials-stats':
+            ensure_dashboard_data_fresh()
             self.send_json(read_json(DATA / 'officials_stats.json', {}))
         elif p == '/api/morning-brief':
             self.send_json(read_json(DATA / 'morning_brief.json', {}))

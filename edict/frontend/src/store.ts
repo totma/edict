@@ -111,6 +111,7 @@ export const DEPTS = [
   { id: 'gongbu',   label: '工部',   emoji: '🔧', role: '工部尚书', rank: '正二品' },
   { id: 'libu_hr',  label: '吏部',   emoji: '👔', role: '吏部尚书', rank: '正二品' },
   { id: 'zaochao',  label: '钦天监', emoji: '🌟', role: '朝报官',   rank: '正三品' },
+  { id: 'shiguan',  label: '史官',   emoji: '📖', role: '起居注官', rank: '正三品' },
 ];
 
 // ── Templates ──
@@ -396,9 +397,15 @@ export const useStore = create<AppStore>((set, get) => ({
 
   loadAll: async () => {
     const s = get();
-    await s.loadLive();
     const tab = s.activeTab;
-    if (['models', 'skills'].includes(tab)) await s.loadAgentConfig();
+    const jobs: Promise<void>[] = [s.loadLive()];
+
+    if (['models', 'skills'].includes(tab)) jobs.push(s.loadAgentConfig());
+    if (tab === 'officials') jobs.push(s.loadOfficials());
+    if (tab === 'monitor') jobs.push(s.loadAgentsStatus());
+    if (tab === 'morning') jobs.push(s.loadMorning());
+
+    await Promise.all(jobs);
   },
 }));
 

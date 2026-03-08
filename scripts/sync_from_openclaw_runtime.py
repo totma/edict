@@ -5,7 +5,7 @@ import time
 import datetime
 import traceback
 import logging
-from file_lock import atomic_json_write, atomic_json_read
+from file_lock import atomic_json_write, atomic_json_read, atomic_json_update
 
 log = logging.getLogger('sync_runtime')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s', datefmt='%H:%M:%S')
@@ -21,6 +21,44 @@ def write_status(**kwargs):
     atomic_json_write(SYNC_STATUS, kwargs)
 
 
+def merge_runtime_tasks_with_current(current_tasks, fresh_tasks):
+    """在持锁状态下合并最新 runtime 任务，并保留最近的旧 runtime 结果。"""
+    current_tasks = current_tasks if isinstance(current_tasks, list) else []
+    jjc_existing = [
+        task for task in current_tasks
+        if str(task.get('id', '')).startswith('JJC')
+    ]
+
+    fresh_runtime_tasks = [
+        task for task in fresh_tasks
+        if not str(task.get('id', '')).startswith('JJC')
+    ]
+
+    now_ms = int(time.time() * 1000)
+    retain_after_ms = now_ms - 36 * 3600 * 1000
+    runtime_by_id = {
+        str(task.get('id', '')): task
+        for task in fresh_runtime_tasks
+        if task.get('id')
+    }
+
+    for task in current_tasks:
+        task_id = str(task.get('id', ''))
+        if not task_id or task_id.startswith('JJC') or task_id in runtime_by_id:
+            continue
+
+        updated_at = task.get('sourceMeta', {}).get('updatedAt', 0)
+        if isinstance(updated_at, (int, float)) and updated_at >= retain_after_ms:
+            runtime_by_id[task_id] = task
+
+    runtime_tasks = sorted(
+        runtime_by_id.values(),
+        key=lambda x: x.get('sourceMeta', {}).get('updatedAt', 0),
+        reverse=True,
+    )
+    return jjc_existing + runtime_tasks
+
+
 def ms_to_str(ts_ms):
     if not ts_ms:
         return '-'
@@ -33,7 +71,7 @@ def ms_to_str(ts_ms):
 def state_from_session(age_ms, aborted):
     if aborted:
         return 'Blocked'
-    if age_ms <= 2 * 60 * 1000:
+    if age_ms <= 10 * 60 * 1000:
         return 'Doing'
     if age_ms <= 60 * 60 * 1000:
         return 'Review'
@@ -267,60 +305,51 @@ def main():
                 deduped.append(t)
         tasks = deduped
 
-        # ── 过滤掉非 JJC 且非活跃的系统会话，防止看板噪音 ──
-        # 规则: 仅保留 24小时内更新的活跃会话，且排除 cron/subagent 等纯后台任务
         filtered_tasks = []
         one_day_ago = now_ms - 24 * 3600 * 1000
         for t in tasks:
-            # 始终保留 JJC 任务（如果有的话，虽然这里主要是 OC 任务，但以防万一）
             if str(t['id']).startswith('JJC'):
                 filtered_tasks.append(t)
                 continue
-            
-            # OC 任务过滤
+
             updated = t.get('sourceMeta', {}).get('updatedAt', 0)
             title = t.get('title', '')
-            
-            # 1. 排除太旧的 (超过24小时)
+            session_key = str(t.get('sourceMeta', {}).get('sessionKey', ''))
+            state = t.get('state')
+            is_background = (
+                '定时任务' in title or
+                '子任务' in title or
+                ':cron:' in session_key or
+                ':subagent:' in session_key
+            )
+            is_primary_session = session_key.endswith(':main') or title.endswith('会话')
+
             if updated < one_day_ago:
                 continue
-            
-            # 2. 排除纯后台 cron / subagent 任务，除非它们正在报错
-            if '定时任务' in title or '子任务' in title:
-                # 只有当它 block 或者 error 时才显示，否则视为噪音
-                if t.get('state') != 'Blocked':
-                    continue
 
-            # 3. 排除非活跃的 OC 会话 (超过 5 分钟无响应)，避免污染看板
-            # 除非它是 Blocked (报错)，或者是今天新建的
-            state = t.get('state')
-            # state_from_session: < 2min = Doing, < 60min = Review, else = Next
-            if state not in ('Doing', 'Blocked'):
-                # 如果不是正在进行或报错，就隐藏掉
-                # 特例: 如果是 mission control (mc-) 的心跳，可能也没必要显示，除非 Doing
+            if is_background:
+                if state not in ('Doing', 'Review', 'Blocked'):
+                    continue
+                filtered_tasks.append(t)
                 continue
 
-            filtered_tasks.append(t)
-        
+            if state in ('Doing', 'Review', 'Blocked') or is_primary_session:
+                filtered_tasks.append(t)
+
         tasks = filtered_tasks
         
         # ── 保留已有的 JJC-* 旨意任务（不覆盖皇上下旨记录）──
         # JJC 任务的 now 字段由 Agent 自己通过 kanban_update.py progress 命令主动上报，
-        # 不再从会话日志中被动抓取。这里只做合并，不做 activity 映射。
-        existing_tasks_file = DATA / 'tasks_source.json'
-        if existing_tasks_file.exists():
-            try:
-                existing = json.loads(existing_tasks_file.read_text())
-                jjc_existing = [t for t in existing if str(t.get('id', '')).startswith('JJC')]
-                
-                # 去掉 tasks 里已有的 JJC（以防重复），再把旨意放到最前面
-                tasks = [t for t in tasks if not str(t.get('id', '')).startswith('JJC')]
-                tasks = jjc_existing + tasks
-            except Exception as e:
-                log.error(f'merge existing JJC tasks failed: {e}')
-                pass
+        # 不再从会话日志中被动抓取。这里在持锁状态下做最终合并，避免覆盖并发的旨意更新。
+        merged_count = [0]
 
-        atomic_json_write(DATA / 'tasks_source.json', tasks)
+        def merge_with_latest(current):
+            merged = merge_runtime_tasks_with_current(current, tasks)
+            merged_count[0] = len(merged)
+            return merged
+
+        atomic_json_update(DATA / 'tasks_source.json', merge_with_latest, [])
+        tasks = atomic_json_read(DATA / 'tasks_source.json', tasks)
 
         duration_ms = int((time.time() - start) * 1000)
         write_status(
@@ -328,12 +357,12 @@ def main():
             lastSyncAt=now,
             durationMs=duration_ms,
             source='openclaw_runtime_sessions',
-            recordCount=len(tasks),
+            recordCount=merged_count[0] or len(tasks),
             scannedSessionFiles=scan_files,
             missingFields={},
             error=None,
         )
-        log.info(f'synced {len(tasks)} tasks from openclaw runtime in {duration_ms}ms')
+        log.info(f'synced {merged_count[0] or len(tasks)} tasks from openclaw runtime in {duration_ms}ms')
 
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
